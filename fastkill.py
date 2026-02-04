@@ -238,11 +238,16 @@ class ProcessManager(Gtk.Window):
         frame.add(scrolled)
         main_box.pack_start(frame, True, True, 0)
 
-        # Bottom button
-        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        # Bottom buttons
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         btn_box.set_margin_top(6)
 
+        self.select_all_btn = Gtk.Button(label="Unselect All")
+        self.select_all_btn.connect('clicked', self.on_select_all_clicked)
+        btn_box.pack_start(self.select_all_btn, False, False, 0)
+
         self.kill_btn = Gtk.Button(label="Kill Selected")
+        self.kill_btn.get_style_context().add_class('destructive-action')
         self.kill_btn.connect('clicked', self.on_kill_clicked)
         btn_box.pack_end(self.kill_btn, False, False, 0)
 
@@ -271,13 +276,28 @@ class ProcessManager(Gtk.Window):
                 selected.append(row.proc)
         return selected
 
+    def all_selected(self) -> bool:
+        """Check if all processes are selected."""
+        children = self.listbox.get_children()
+        if not children:
+            return False
+        return all(row.checkbox.get_active() for row in children)
+
+    def on_select_all_clicked(self, _button) -> None:
+        """Toggle selection of all processes."""
+        select = not self.all_selected()
+        for row in self.listbox.get_children():
+            row.checkbox.set_active(select)
+        self.update_button_label()
+
     def update_button_label(self) -> None:
-        """Update kill button text with count."""
+        """Update button labels based on selection state."""
         count = len(self.get_selected())
         if self.kill_mode == 'term':
             self.kill_btn.set_label(f"Kill Selected ({count})")
         else:
             self.kill_btn.set_label(f"Force Kill ({count})")
+        self.select_all_btn.set_label("Unselect All" if self.all_selected() else "Select All")
 
     def on_kill_clicked(self, _button) -> None:
         """Handle kill button click."""
