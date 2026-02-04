@@ -3,6 +3,7 @@
 
 import os
 import signal
+from collections import defaultdict
 from pathlib import Path
 from typing import NamedTuple
 
@@ -46,7 +47,8 @@ SCRIPT_PID = os.getpid()
 
 class ProcessInfo(NamedTuple):
     pid: int
-    title: str
+    name: str  # executable name for grouping
+    title: str  # full display title
     description: str
 
 
@@ -137,28 +139,35 @@ def get_processes() -> list[ProcessInfo]:
                 continue
 
             cmdline = cmdline_raw.rstrip('\x00').split('\x00')
-            title = Path(cmdline[0]).name
+            parts = cmdline[0].split(maxsplit=1)
+            exe = parts[0]
+            name = Path(exe).name
+            # Title: name + any inline flags from cmdline[0]
+            title = name + (' ' + parts[1] if len(parts) > 1 else '')
 
-            if title in EXCLUDED:
+            if name in EXCLUDED:
                 continue
-            if title.startswith(('gvfs', 'xdg-', 'at-spi', 'ibus-', 'glycin-', '(')):
+            if name.startswith(('gvfs', 'xdg-', 'at-spi', 'ibus-', 'glycin-', '(')):
                 continue
 
             description = get_description(cmdline)
-            processes.append(ProcessInfo(pid, title, description))
+            processes.append(ProcessInfo(pid, name, title, description))
 
         except (FileNotFoundError, PermissionError, StopIteration):
             continue
 
-    return sorted(processes, key=lambda p: p.title.lower())
+    return sorted(processes, key=lambda p: p.name.lower())
 
 
-class ProcessRow(Gtk.ListBoxRow):
-    """A row representing a process with checkbox."""
+class GroupHeaderRow(Gtk.ListBoxRow):
+    """A header row for a group of processes with the same title."""
 
-    def __init__(self, proc: ProcessInfo, on_toggle: callable = None):
+    def __init__(self, title: str, count: int, on_toggle: callable = None):
         super().__init__()
-        self.proc = proc
+        self.title = title
+        self.children: list['ProcessRow'] = []
+        self._updating = False
+        self._on_toggle = on_toggle
 
         hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         hbox.set_margin_start(6)
@@ -168,22 +177,79 @@ class ProcessRow(Gtk.ListBoxRow):
 
         self.checkbox = Gtk.CheckButton()
         self.checkbox.set_active(True)
-        if on_toggle:
-            self.checkbox.connect('toggled', lambda _: on_toggle())
+        self.checkbox.connect('toggled', self._on_checkbox_toggled)
+        hbox.pack_start(self.checkbox, False, False, 0)
+
+        display_title = title[:64] + "…" if len(title) > 64 else title
+        title_label = Gtk.Label(xalign=0)
+        title_label.set_markup(f"<b>{GLib.markup_escape_text(display_title)}</b> ({count})")
+        hbox.pack_start(title_label, True, True, 0)
+
+        self.add(hbox)
+
+    def _on_checkbox_toggled(self, _checkbox) -> None:
+        """Handle group checkbox toggle - update all children."""
+        if self._updating:
+            return
+        self._updating = True
+        state = self.checkbox.get_active()
+        self.checkbox.set_inconsistent(False)
+        for child in self.children:
+            child.checkbox.set_active(state)
+        self._updating = False
+        if self._on_toggle:
+            self._on_toggle()
+
+    def update_checkbox_state(self) -> None:
+        """Update checkbox based on children's states (tri-state logic)."""
+        if self._updating or not self.children:
+            return
+        self._updating = True
+        selected = sum(1 for c in self.children if c.checkbox.get_active())
+        if selected == 0:
+            self.checkbox.set_active(False)
+            self.checkbox.set_inconsistent(False)
+        elif selected == len(self.children):
+            self.checkbox.set_active(True)
+            self.checkbox.set_inconsistent(False)
+        else:
+            self.checkbox.set_active(False)
+            self.checkbox.set_inconsistent(True)
+        self._updating = False
+
+
+class ProcessRow(Gtk.ListBoxRow):
+    """A row representing a process with checkbox."""
+
+    def __init__(self, proc: ProcessInfo, on_toggle: callable = None, group: GroupHeaderRow = None):
+        super().__init__()
+        self.proc = proc
+        self.group = group
+
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        indent = 24 if group else 6
+        hbox.set_margin_start(indent)
+        hbox.set_margin_end(6)
+        hbox.set_margin_top(4)
+        hbox.set_margin_bottom(4)
+
+        self.checkbox = Gtk.CheckButton()
+        self.checkbox.set_active(True)
+        self._on_toggle = on_toggle
+        self.checkbox.connect('toggled', self._handle_toggle)
         hbox.pack_start(self.checkbox, False, False, 0)
 
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
 
         display_title = proc.title[:64] + "…" if len(proc.title) > 64 else proc.title
         title_label = Gtk.Label(label=display_title, xalign=0)
-        title_label.set_markup(f"<b>{GLib.markup_escape_text(display_title)}</b>")
+        if not group:
+            title_label.set_markup(f"<b>{GLib.markup_escape_text(display_title)}</b>")
         vbox.pack_start(title_label, False, False, 0)
 
         if proc.description:
             desc_label = Gtk.Label(label=proc.description, xalign=0)
             desc_label.set_ellipsize(Pango.EllipsizeMode.START)
-            desc_label.modify_fg(Gtk.StateFlags.NORMAL, None)
-            ctx = desc_label.get_style_context()
             desc_label.set_opacity(0.6)
             vbox.pack_start(desc_label, False, False, 0)
 
@@ -191,6 +257,13 @@ class ProcessRow(Gtk.ListBoxRow):
         self.add(hbox)
 
         self.set_tooltip_text(get_process_details(proc.pid))
+
+    def _handle_toggle(self, _checkbox) -> None:
+        """Handle checkbox toggle - notify group and callback."""
+        if self.group:
+            self.group.update_checkbox_state()
+        if self._on_toggle:
+            self._on_toggle()
 
 
 class ProcessManager(Gtk.Window):
@@ -261,9 +334,22 @@ class ProcessManager(Gtk.Window):
             self.listbox.remove(child)
 
         processes = get_processes()
+        grouped: dict[str, list[ProcessInfo]] = defaultdict(list)
         for proc in processes:
-            row = ProcessRow(proc, on_toggle=self.update_button_label)
-            self.listbox.add(row)
+            grouped[proc.name].append(proc)
+
+        for name in sorted(grouped.keys(), key=str.lower):
+            procs = grouped[name]
+            if len(procs) == 1:
+                row = ProcessRow(procs[0], on_toggle=self.update_button_label)
+                self.listbox.add(row)
+            else:
+                group = GroupHeaderRow(name, len(procs), on_toggle=self.update_button_label)
+                self.listbox.add(group)
+                for proc in procs:
+                    row = ProcessRow(proc, on_toggle=self.update_button_label, group=group)
+                    group.children.append(row)
+                    self.listbox.add(row)
 
         self.listbox.show_all()
         self.update_button_label()
@@ -272,22 +358,28 @@ class ProcessManager(Gtk.Window):
         """Get list of selected processes."""
         selected = []
         for row in self.listbox.get_children():
-            if row.checkbox.get_active():
+            if isinstance(row, ProcessRow) and row.checkbox.get_active():
                 selected.append(row.proc)
         return selected
 
     def all_selected(self) -> bool:
         """Check if all processes are selected."""
-        children = self.listbox.get_children()
-        if not children:
+        process_rows = [r for r in self.listbox.get_children() if isinstance(r, ProcessRow)]
+        if not process_rows:
             return False
-        return all(row.checkbox.get_active() for row in children)
+        return all(row.checkbox.get_active() for row in process_rows)
 
     def on_select_all_clicked(self, _button) -> None:
         """Toggle selection of all processes."""
         select = not self.all_selected()
         for row in self.listbox.get_children():
-            row.checkbox.set_active(select)
+            if isinstance(row, ProcessRow):
+                row.checkbox.set_active(select)
+            elif isinstance(row, GroupHeaderRow):
+                row._updating = True
+                row.checkbox.set_active(select)
+                row.checkbox.set_inconsistent(False)
+                row._updating = False
         self.update_button_label()
 
     def update_button_label(self) -> None:
